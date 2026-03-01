@@ -145,6 +145,11 @@ function e.IsCoop(missionCode)
 	return false
 end
 
+-- =============================================================================
+-- NUCLEAR BOMB: Judge Authority System hooks
+-- NuclearBomb.lua must be loaded before TppMain (via script_loader or require)
+-- =============================================================================
+
 function e.OnAllocate(n)
 	-- If you are loading a mission from a checkpoint with already placed marker, game will attempt to restore
 	-- that marker through tpp::ui::menu::UiDepend::ActUserMarkerSaveLoad function (not lua).
@@ -154,6 +159,11 @@ function e.OnAllocate(n)
     if e.IsCoop(vars.missionCode) then
         Dynamite.IgnoreMarkerRequests()
     end
+
+	-- NUCLEAR BOMB: Initialize Judge Authority system at mission start
+	if NuclearBomb then
+		NuclearBomb.Init()
+	end
 
 	TppWeather.OnEndMissionPrepareFunction()
 	e.DisableGameStatus()
@@ -866,6 +876,16 @@ function e.OnUpdate(e)
 		n[e]()
 	end
 	f()
+
+	-- NUCLEAR BOMB: Tick the Judge system every frame
+	if NuclearBomb then
+		NuclearBomb.OnUpdate()
+
+		-- Debug override: manual authority toggle via RELOAD button
+		if TppInput and TppInput.IsButtonPush and TppInput.IsButtonPush("RELOAD") then
+			NuclearBomb.DebugToggleAuthority()
+		end
+	end
 end
 function e.OnChangeSVars(e, i, n)
 	for t, e in ipairs(Tpp._requireList) do
@@ -909,6 +929,12 @@ function e.OnMessage(n, e, i, a, p, t, o)
 	if m < T then
 		return Mission.ON_MESSAGE_RESULT_RESEND
 	end
+
+	-- NUCLEAR BOMB: Intercept Judge system messages before general dispatch
+	if NuclearBomb then
+		NuclearBomb.OnMessage(e, { id = e, gameObjectId = a, judgeIsGuest = p })
+	end
+
 	for n = 1, r do
 		local s = s
 		d[n](e, i, a, p, t, o, s)
