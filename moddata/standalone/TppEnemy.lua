@@ -3494,7 +3494,18 @@ function e.InitializeHostage2()
 		TppHostage2.ClearUniquePartsPath()
 	end
 end
+-- =============================================================================
+-- NUCLEAR BOMB: Judge Authority hooks
+-- Enemy AI init and perception are gated behind NuclearBomb.IsJudge() so only
+-- the authoritative peer (the Judge) runs simulation logic, preventing desync.
+-- =============================================================================
+
 function e.Init(n)
+	-- NUCLEAR BOMB: Register this enemy module so the Judge system tracks it
+	if NuclearBomb then
+		mvars._nb_enemyJudgeEnabled = true
+	end
+
 	mvars.ene_routeAnimationGaniPathTable = {
 		{ "SoldierLookWatch", "/Assets/tpp/motion/SI_game/fani/bodies/enem/enemasr/enemasr_s_pat_idl_act_a.gani" },
 		{ "SoldierWipeFace", "/Assets/tpp/motion/SI_game/fani/bodies/enem/enemasr/enemasr_s_pat_idl_act_d.gani" },
@@ -5378,6 +5389,9 @@ function e.SetupActivateQuestCp(e)
 	end
 end
 function e.SetupActivateQuestEnemy(p)
+	-- NUCLEAR BOMB: Only the Judge activates/spawns enemies to prevent double-spawn desync
+	if NuclearBomb and not NuclearBomb.IsJudge() then return end
+
 	local i = 1
 	local function s(n, r)
 		local t = n.enemyName
@@ -6184,6 +6198,9 @@ function e.IsSpecialEventFOB()
 	return e.IsParasiteMetalEventFOB()
 end
 function e._OnDead(n, i)
+	-- NUCLEAR BOMB: Only the Judge resolves NPC death consequences
+	if NuclearBomb and not NuclearBomb.IsJudge() then return end
+
 	local a
 	if i then
 		a = Tpp.IsPlayer(i)
@@ -6235,6 +6252,9 @@ function e._OnFulton(n, a, a, t)
 	e._OnRecoverNPC(n, t)
 end
 function e._OnDamage(a, n, t)
+	-- NUCLEAR BOMB: Only the Judge processes damage and triggers damage-response logic
+	if NuclearBomb and not NuclearBomb.IsJudge() then return end
+
 	if e.IsRescueTarget(a) then
 		e._OnDamageOfRescueTarget(n, t)
 	end
