@@ -8,6 +8,22 @@ local modules = {}
 local initialized = false
 local playSound = false
 
+-- =============================================================================
+-- NUCLEAR BOMB: Load the Judge Authority module into _G before TppMain starts.
+-- NuclearBomb.lua must sit alongside this file in the outsidescripts folder.
+-- =============================================================================
+local _nb_ok, _nb_err = xpcall(function()
+	require("NuclearBomb")
+end, function(err)
+	if helpers and helpers.log then
+		helpers.log("NUCLEAR BOMB: Failed to load NuclearBomb.lua: " .. tostring(err), true, "e")
+	end
+end)
+if not _nb_ok then
+	-- Non-fatal: mod will run without Judge system (falls back to vanilla behaviour)
+	helpers.log("NUCLEAR BOMB: Judge system disabled (load error)", true, "w")
+end
+
 function script_loader.read_config()
 	local config_path = helpers.get_game_path() .. "\\dynamite\\dynamite.ini"
 	if helpers.readable(config_path) == nil then
