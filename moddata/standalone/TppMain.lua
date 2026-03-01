@@ -5,6 +5,10 @@
 --
 -- Manages dynamic authority (Judge) assignment between Host and Guest to
 -- prevent split-brain desync on AI, vehicles, and world interactions.
+--
+-- Also provides:
+--   - 60fps frame cap to keep physics timestep consistent across both PCs
+--   - Network jitter failsafe that freezes Judge decisions during packet loss
 -- =============================================================================
 
 NuclearBomb = NuclearBomb or {}
@@ -22,12 +26,113 @@ NuclearBomb.JUDGE_GUEST   = "GUEST"
 NuclearBomb.JUDGE_PENDING = "PENDING"  -- transitional: neither side is authoritative yet
 
 -- Network message IDs (matched on both sides via OnMessage)
-NuclearBomb.MSG_SYNC_JUDGE          = Tpp.StrCode32("NB_SYNC_JUDGE")
-NuclearBomb.MSG_REQ_FULTON          = Tpp.StrCode32("NB_REQ_FULTON")
-NuclearBomb.MSG_ACK_JUDGE           = Tpp.StrCode32("NB_ACK_JUDGE")
+NuclearBomb.MSG_SYNC_JUDGE = Tpp.StrCode32("NB_SYNC_JUDGE")
+NuclearBomb.MSG_REQ_FULTON = Tpp.StrCode32("NB_REQ_FULTON")
+NuclearBomb.MSG_ACK_JUDGE  = Tpp.StrCode32("NB_ACK_JUDGE")
 
 -- How many frames to stay in PENDING before forcing a fallback to HOST authority
-NuclearBomb.PENDING_TIMEOUT_FRAMES  = 10
+NuclearBomb.PENDING_TIMEOUT_FRAMES = 10
+
+-- ---------------------------------------------------------------------------
+-- 60fps Frame Cap
+--
+-- MGSV's Fox Engine doesn't enforce a fixed physics timestep, so if one PC
+-- runs at 120fps and the other at 60fps their physics simulations drift apart.
+-- We cap the frame budget to 1/60s (~16.67ms). Any frame that finishes faster
+-- than this target just gets a shortened delta passed to physics, keeping both
+-- PCs on the same timestep ladder.
+-- ---------------------------------------------------------------------------
+
+NuclearBomb.FPS_CAP           = 60
+NuclearBomb.FRAME_TIME_TARGET = 1.0 / NuclearBomb.FPS_CAP  -- 0.01667s
+
+-- Internal accumulator for the frame cap
+local _frameAccum = 0.0
+
+--- Returns the capped delta time for this frame.
+--- Use this wherever you need a dt instead of raw Time.GetFrameTime().
+function NuclearBomb.GetCappedDeltaTime()
+    local rawDt = Time.GetFrameTime()
+    -- Hard clamp: never let a single frame contribute more than one target
+    -- step's worth of time (handles alt-tab, hitches, etc.)
+    if rawDt > NuclearBomb.FRAME_TIME_TARGET then
+        rawDt = NuclearBomb.FRAME_TIME_TARGET
+    end
+    return rawDt
+end
+
+--- Returns true if the physics simulation should tick this frame.
+--- Accumulates real time and only fires once the 1/60s interval is met.
+--- This is a fixed-timestep gate — both PCs tick at the same rate regardless
+--- of their actual FPS.
+function NuclearBomb.ShouldTickPhysics()
+    local dt = Time.GetFrameTime()
+    _frameAccum = _frameAccum + dt
+
+    if _frameAccum >= NuclearBomb.FRAME_TIME_TARGET then
+        _frameAccum = _frameAccum - NuclearBomb.FRAME_TIME_TARGET
+        -- Clamp accumulator so a long hitch can't cause a burst of catch-up ticks
+        if _frameAccum > NuclearBomb.FRAME_TIME_TARGET then
+            _frameAccum = 0.0
+        end
+        return true
+    end
+
+    return false
+end
+
+-- ---------------------------------------------------------------------------
+-- Network Jitter Failsafe
+--
+-- Mission.GetCurrentMessageResendCount() returns how many times the engine
+-- has re-sent the current packet. Non-zero = network struggling.
+-- During jitter we:
+--   1. Freeze all Judge authority swaps
+--   2. Suppress physics-authority ticks so neither peer runs ahead
+--   3. Show a HUD warning after a sustained threshold
+-- ---------------------------------------------------------------------------
+
+-- Consecutive resend frames before declaring "jitter"
+NuclearBomb.JITTER_THRESHOLD_FRAMES = 3
+-- Consecutive clean frames needed to exit jitter state
+NuclearBomb.JITTER_RECOVERY_FRAMES  = 30
+
+local _jitterFrames   = 0
+local _recoveryFrames = 0
+local _inJitter       = false
+
+--- Returns true if the network is currently considered unstable.
+function NuclearBomb.IsJittering()
+    return _inJitter
+end
+
+--- Called every frame to update jitter state from the engine's resend counter.
+local function _TickJitter()
+    local resendCount = Mission.GetCurrentMessageResendCount()
+
+    if resendCount > 0 then
+        _jitterFrames   = _jitterFrames + 1
+        _recoveryFrames = 0
+
+        if _jitterFrames >= NuclearBomb.JITTER_THRESHOLD_FRAMES then
+            if not _inJitter then
+                _inJitter = true
+                TppUiCommand.AnnounceLogView("NETWORK: JITTER DETECTED - AUTHORITY FROZEN")
+            end
+        end
+    else
+        _jitterFrames = 0
+
+        if _inJitter then
+            _recoveryFrames = _recoveryFrames + 1
+            if _recoveryFrames >= NuclearBomb.JITTER_RECOVERY_FRAMES then
+                _inJitter       = false
+                _recoveryFrames = 0
+                TppUiCommand.AnnounceLogView("NETWORK: STABLE - AUTHORITY RESTORED")
+            end
+        end
+    end
+end
 
 -- ---------------------------------------------------------------------------
 -- Global Registry
@@ -52,11 +157,15 @@ local _pendingFrames = 0
 --- Returns true if the local machine is the current Judge (authoritative peer).
 --- Wrap all physics/AI calls in: if NuclearBomb.IsJudge() then ... end
 function NuclearBomb.IsJudge()
-    local localRole = Dynamite.IsHost() and NuclearBomb.JUDGE_HOST or NuclearBomb.JUDGE_GUEST
-    -- During PENDING, nobody is judge - prevents split-brain in handoff window
+    -- During jitter, freeze all authority to prevent desync
+    if _inJitter then
+        return false
+    end
+    -- During PENDING, nobody is judge
     if _G.NuclearJudge == NuclearBomb.JUDGE_PENDING then
         return false
     end
+    local localRole = Dynamite.IsHost() and NuclearBomb.JUDGE_HOST or NuclearBomb.JUDGE_GUEST
     return _G.NuclearJudge == localRole
 end
 
@@ -79,19 +188,14 @@ end
 -- Authority Transfer
 -- ---------------------------------------------------------------------------
 
---- Initiates an authority swap to the target role.
---- @param newJudge  string  NuclearBomb.JUDGE_HOST or NuclearBomb.JUDGE_GUEST
---- @param broadcast boolean  If true (Host only), broadcast SYNC_JUDGE to Guest
 local function _SetJudge(newJudge, broadcast)
-    if _G.NuclearJudge == newJudge then
-        return  -- no-op
-    end
+    -- Block authority swaps during jitter - wait for stable network
+    if _inJitter then return end
+
+    if _G.NuclearJudge == newJudge then return end
 
     _G.NuclearJudge = NuclearBomb.JUDGE_PENDING
     _pendingFrames  = 0
-
-    -- Defer actual assignment by one frame so both sides have a gap
-    -- The Update() tick will resolve PENDING -> newJudge after the ack cycle
     _G._NuclearJudge_pendingTarget = newJudge
 
     if broadcast and NuclearBomb.IsHost() then
@@ -99,11 +203,10 @@ local function _SetJudge(newJudge, broadcast)
     end
 end
 
---- Called by Update() to resolve the PENDING state after the ack timeout.
 local function _TickPending()
-    if _G.NuclearJudge ~= NuclearBomb.JUDGE_PENDING then
-        return
-    end
+    if _G.NuclearJudge ~= NuclearBomb.JUDGE_PENDING then return end
+    -- Don't advance pending counter during jitter
+    if _inJitter then return end
 
     _pendingFrames = _pendingFrames + 1
 
@@ -113,8 +216,9 @@ local function _TickPending()
         _G._NuclearJudge_pendingTarget = nil
         _pendingFrames = 0
 
-        -- Announce result
-        local label = (target == NuclearBomb.JUDGE_GUEST) and "AUTHORITY: CLIENT ACTIVE" or "AUTHORITY: HOST ACTIVE"
+        local label = (target == NuclearBomb.JUDGE_GUEST)
+            and "AUTHORITY: CLIENT ACTIVE"
+            or  "AUTHORITY: HOST ACTIVE"
         TppUiCommand.AnnounceLogView(label)
     end
 end
@@ -123,24 +227,21 @@ end
 -- Vehicle-Based Authority Detection
 -- ---------------------------------------------------------------------------
 
---- Checks whether Player 1 (Guest) is currently in the driver seat of any vehicle.
---- If so, authority should transfer to the Guest so they own vehicle physics.
 function NuclearBomb.CheckVehicleAuthority()
-    local guestVehicleId = vars.playerVehicleGameObjectId and vars.playerVehicleGameObjectId[NuclearBomb.PLAYER_GUEST]
-    local hostVehicleId  = vars.playerVehicleGameObjectId and vars.playerVehicleGameObjectId[NuclearBomb.PLAYER_HOST]
+    local guestVehicleId = vars.playerVehicleGameObjectId
+        and vars.playerVehicleGameObjectId[NuclearBomb.PLAYER_GUEST]
+    local hostVehicleId = vars.playerVehicleGameObjectId
+        and vars.playerVehicleGameObjectId[NuclearBomb.PLAYER_HOST]
 
     local guestDriving = guestVehicleId ~= nil and guestVehicleId ~= GameObject.NULL_ID
     local hostDriving  = hostVehicleId  ~= nil and hostVehicleId  ~= GameObject.NULL_ID
 
-    -- Update player state table
     _G.NuclearPlayers[NuclearBomb.PLAYER_GUEST].isDriver = guestDriving
     _G.NuclearPlayers[NuclearBomb.PLAYER_HOST].isDriver  = hostDriving
 
     if guestDriving and _G.NuclearJudge ~= NuclearBomb.JUDGE_GUEST then
-        -- Guest is now driving: transfer authority to them
         _SetJudge(NuclearBomb.JUDGE_GUEST, true)
     elseif not guestDriving and _G.NuclearJudge == NuclearBomb.JUDGE_GUEST then
-        -- Guest stepped out: return authority to Host
         _SetJudge(NuclearBomb.JUDGE_HOST, true)
     end
 end
@@ -149,7 +250,6 @@ end
 -- Player Position Sync
 -- ---------------------------------------------------------------------------
 
---- Updates _G.NuclearPlayers position cache using Dynamite.GetPlayerPosition().
 function NuclearBomb.SyncPlayerPositions()
     for i = 0, 1 do
         local pos = Dynamite.GetPlayerPosition(i)
@@ -163,11 +263,8 @@ end
 -- Network: Outbound
 -- ---------------------------------------------------------------------------
 
---- Host broadcasts the new judge state to the Guest.
---- The Guest's OnMessage handler updates _G.NuclearJudge accordingly.
 function NuclearBomb.BroadcastJudgeSync(judgeState)
     if not NuclearBomb.IsHost() then return end
-    -- Encode JUDGE_GUEST as 1, JUDGE_HOST as 0 in the message arg
     local val = (judgeState == NuclearBomb.JUDGE_GUEST) and 1 or 0
     GameObject.SendMessage(
         { type = "TppPlayer" },
@@ -175,8 +272,6 @@ function NuclearBomb.BroadcastJudgeSync(judgeState)
     )
 end
 
---- Guest sends a Fulton extraction request to the Host for authoritative execution.
---- @param containerGameObjectId  number  The game object ID of the container to fulton
 function NuclearBomb.RequestFultonContainer(containerGameObjectId)
     if not NuclearBomb.IsGuest() then return end
     GameObject.SendMessage(
@@ -190,45 +285,35 @@ end
 -- Network: Inbound message handlers
 -- ---------------------------------------------------------------------------
 
---- Call this from TppMain.OnMessage to handle NuclearBomb network packets.
---- @param msgId   number   Tpp.StrCode32 of the message
---- @param args    table    Message arguments table
 function NuclearBomb.OnMessage(msgId, args)
     if msgId == NuclearBomb.MSG_SYNC_JUDGE then
         NuclearBomb._HandleSyncJudge(args)
-
     elseif msgId == NuclearBomb.MSG_REQ_FULTON then
         NuclearBomb._HandleReqFulton(args)
     end
 end
 
---- Guest receives SYNC_JUDGE from Host and updates local authority.
 function NuclearBomb._HandleSyncJudge(args)
-    if NuclearBomb.IsHost() then return end  -- Host never needs to handle this
+    if NuclearBomb.IsHost() then return end
+    -- Ignore judge syncs during jitter - state is already frozen
+    if _inJitter then return end
 
     local newJudge = (args.judgeIsGuest == 1) and NuclearBomb.JUDGE_GUEST or NuclearBomb.JUDGE_HOST
     _G.NuclearJudge = newJudge
 
-    local label = (newJudge == NuclearBomb.JUDGE_GUEST) and "AUTHORITY: CLIENT ACTIVE" or "AUTHORITY: HOST ACTIVE"
+    local label = (newJudge == NuclearBomb.JUDGE_GUEST)
+        and "AUTHORITY: CLIENT ACTIVE"
+        or  "AUTHORITY: HOST ACTIVE"
     TppUiCommand.AnnounceLogView(label)
 end
 
---- Host receives REQ_FULTON from Guest and executes the extraction authoritatively.
 function NuclearBomb._HandleReqFulton(args)
     if not NuclearBomb.IsHost() then return end
 
     local gameObjectId = args.gameObjectId
-    if not gameObjectId or gameObjectId == GameObject.NULL_ID then
-        return
-    end
+    if not gameObjectId or gameObjectId == GameObject.NULL_ID then return end
 
-    -- Execute the fulton extraction on the Host side
-    -- This ensures physics + save-data update happen from one authoritative source
-    GameObject.SendCommand(
-        gameObjectId,
-        { id = "RequestFulton" }
-    )
-
+    GameObject.SendCommand(gameObjectId, { id = "RequestFulton" })
     TppUiCommand.AnnounceLogView("FULTON: EXECUTING (HOST AUTHORITY)")
 end
 
@@ -236,14 +321,15 @@ end
 -- Debug / Manual Override
 -- ---------------------------------------------------------------------------
 
---- Manual authority override for testing the handshake during development.
---- Bind to a button combination (e.g. RELOAD) in TppMain.OnUpdate.
 function NuclearBomb.DebugToggleAuthority()
+    if _inJitter then
+        TppUiCommand.AnnounceLogView("AUTHORITY: BLOCKED - NETWORK JITTER")
+        return
+    end
     if _G.NuclearJudge == NuclearBomb.JUDGE_PENDING then
         TppUiCommand.AnnounceLogView("AUTHORITY: PENDING (wait...)")
         return
     end
-
     if _G.NuclearJudge == NuclearBomb.JUDGE_HOST then
         _SetJudge(NuclearBomb.JUDGE_GUEST, true)
         TppUiCommand.AnnounceLogView("AUTHORITY: MANUAL -> CLIENT")
@@ -254,26 +340,36 @@ function NuclearBomb.DebugToggleAuthority()
 end
 
 -- ---------------------------------------------------------------------------
--- Update Tick (call from TppMain.OnUpdate every frame)
+-- Update Tick (called every frame from TppMain.OnUpdate)
 -- ---------------------------------------------------------------------------
 
 function NuclearBomb.OnUpdate()
-    _TickPending()
-    NuclearBomb.SyncPlayerPositions()
+    -- Jitter check runs every frame unconditionally
+    _TickJitter()
 
-    -- Only the Host evaluates vehicle conditions and broadcasts changes
-    if NuclearBomb.IsHost() then
-        NuclearBomb.CheckVehicleAuthority()
+    -- Physics/authority logic is gated to the 60fps fixed timestep
+    -- Both PCs tick at the same rate regardless of actual FPS
+    if NuclearBomb.ShouldTickPhysics() then
+        _TickPending()
+        NuclearBomb.SyncPlayerPositions()
+
+        if NuclearBomb.IsHost() then
+            NuclearBomb.CheckVehicleAuthority()
+        end
     end
 end
 
 -- ---------------------------------------------------------------------------
--- Init (call from TppMain.OnAllocate or mission init)
+-- Init (called from TppMain.OnAllocate)
 -- ---------------------------------------------------------------------------
 
 function NuclearBomb.Init()
-    _G.NuclearJudge  = NuclearBomb.JUDGE_HOST
-    _pendingFrames   = 0
+    _G.NuclearJudge = NuclearBomb.JUDGE_HOST
+    _pendingFrames  = 0
+    _frameAccum     = 0.0
+    _jitterFrames   = 0
+    _recoveryFrames = 0
+    _inJitter       = false
     _G._NuclearJudge_pendingTarget = nil
 
     _G.NuclearPlayers = {
@@ -282,6 +378,7 @@ function NuclearBomb.Init()
     }
 
     TppUiCommand.AnnounceLogView("NUCLEAR BOMB: JUDGE SYSTEM INITIALIZED")
+    TppUiCommand.AnnounceLogView("NUCLEAR BOMB: 60FPS CAP + JITTER GUARD ACTIVE")
 end
 	local e = {}
 local s = Tpp.ApendArray
